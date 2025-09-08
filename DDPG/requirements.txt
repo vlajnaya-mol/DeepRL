@@ -1,0 +1,8 @@
+torch==1.10.2
+numpy
+matplotlib
+tqdm
+pandas
+gym[classic_control]==0.21.0
+gym[box2d]==0.21.0
+tqdm

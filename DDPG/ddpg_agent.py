@@ -1,0 +1,422 @@
+"""DDPG-style agent with OU exploration noise and replay buffer.
+
+This module defines:
+- Agent: interacts with the environment, stores experience, and learns.
+- OUNoise: Ornstein–Uhlenbeck noise for temporally correlated exploration.
+- ReplayBuffer: experience replay with on-sample observation normalization.
+- NormPlaceholder: no-op normalizer (default).
+- SimpleNormalizer: running mean/var normalizer (optional).
+
+Notes:
+- Observations are normalized inside ReplayBuffer.sample().
+- Targets are soft-updated with a standard τ-blend each learning step.
+"""
+
+import random
+from collections import namedtuple, deque
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+
+from model import Actor, Critic
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+class Agent:
+    """Interacts with and learns from the environment using DDPG-style updates."""
+
+    def __init__(
+        self,
+        state_size: int,
+        action_size: int,
+        random_seed: int,
+        buffer_size: int = int(1e6),
+        batch_size: int = 128,
+        gamma: float = 0.99,
+        tau: float = 1e-3,
+        lr_actor: float = 1e-4,
+        lr_critic: float = 3e-4,
+        weight_decay: float = 1e-4,
+        noise_mu: float = 0.0,
+        noise_theta: float = 0.15,
+        noise_sigma: float = 0.2,
+        warmup_steps: int = 20_000,
+        updates_per_step: int = 1,
+        update_each: int = 1,
+    ) -> None:
+        """Initialize an Agent.
+
+        Args:
+            state_size: Dimension of each state.
+            action_size: Dimension of each action.
+            random_seed: RNG seed for Python, NumPy, and PyTorch components.
+            buffer_size: Replay buffer capacity (number of transitions).
+            batch_size: Minibatch size sampled from replay.
+            gamma: Discount factor.
+            tau: Soft-update interpolation factor for target networks.
+            lr_actor: Learning rate for the actor.
+            lr_critic: Learning rate for the critic.
+            weight_decay: L2 weight decay for the critic optimizer.
+            noise_mu: Mean (μ) of OU noise.
+            noise_theta: Mean-reversion rate (θ) of OU noise.
+            noise_sigma: Diffusion coefficient (σ) of OU noise.
+            warmup_steps: Number of env steps before starting gradient updates.
+            updates_per_step: Gradient updates performed for each env step
+                that triggers learning.
+            update_each: Perform updates every `update_each` env steps.
+
+        Notes:
+            - Observations are normalized on sampling from the replay buffer.
+            - Call `reset(progress)` periodically to adapt noise scale across
+              training (e.g., linearly anneal with progress ∈ [0, 1]).
+        """
+        self.state_size = state_size
+        self.action_size = action_size
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+
+        # Hyperparameters
+        self.buffer_size = buffer_size
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.tau = tau
+        self.warmup_steps = warmup_steps
+        self.updates_per_step = updates_per_step
+        self.update_each = update_each
+        self.total_steps = 0
+
+        # Actor networks
+        self.actor_local = Actor(state_size, action_size, random_seed).to(device)
+        self.actor_target = Actor(state_size, action_size, random_seed).to(device)
+        self.actor_target.load_state_dict(self.actor_local.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=lr_actor)
+
+        # Critic networks
+        self.critic_local = Critic(state_size, action_size, random_seed).to(device)
+        self.critic_target = Critic(state_size, action_size, random_seed).to(device)
+        self.critic_target.load_state_dict(self.critic_local.state_dict())
+        self.critic_optimizer = optim.Adam(
+            self.critic_local.parameters(), lr=lr_critic, weight_decay=weight_decay
+        )
+
+        # Exploration noise
+        self.noise = OUNoise(
+            size=action_size,
+            seed=random_seed,
+            mu=noise_mu,
+            theta=noise_theta,
+            sigma=noise_sigma,
+        )
+        self.init_sigma = noise_sigma
+        self.noise_scale = 1.0  # set in reset()
+        self.reset(progress=0.0)
+
+        # Observation normalizer + Replay memory
+        self.obs_norm = NormPlaceholder(state_size)
+        self.memory = ReplayBuffer(
+            state_size=state_size,
+            action_size=action_size,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            seed=random_seed,
+            obs_norm=self.obs_norm,
+        )
+
+    def step(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        """Save experience and, after warmup, perform learning updates.
+
+        Learning is triggered only if:
+        - There are at least `batch_size` items in replay,
+        - `total_steps > warmup_steps`, and
+        - `total_steps % update_each == 0`.
+        """
+        self.total_steps += 1
+        self.memory.add(state, action, reward, next_state, done)
+        self.obs_norm.update(state)
+
+        if (
+            len(self.memory) >= self.batch_size
+            and self.total_steps > self.warmup_steps
+            and self.total_steps % self.update_each == 0
+        ):
+            for _ in range(self.updates_per_step):
+                experiences = self.memory.sample()
+                self.learn(experiences)
+
+    def act(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
+        """Select an action given the current policy.
+
+        Args:
+            state: Observation (D,).
+            add_noise: If True, add OU exploration noise.
+
+        Returns:
+            Action clipped to [-1, 1].
+        """
+        state = self.obs_norm.normalize(state)
+        state_t = torch.from_numpy(state).float().to(device)
+        self.actor_local.eval()
+        with torch.no_grad():
+            action = self.actor_local(state_t).cpu().numpy()
+        self.actor_local.train()
+
+        if add_noise:
+            action = action + self.noise_scale * self.noise.sample()
+
+        return np.clip(action, -1.0, 1.0)
+
+    def reset(self, progress: float) -> None:
+        """Reset OU process and update noise scale based on training progress.
+
+        Args:
+            progress: Value in [0, 1]; higher means later in training.
+                Noise std decays linearly from initial OU std to 0.05.
+        """
+        self.noise.reset()
+        self.noise_scale = self._noise_scale_for_progress(
+            progress, start_std=self.noise.std_ou, end_std=0.05
+        )
+
+
+    def learn(
+        self, experiences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ) -> None:
+        """Update policy and value networks using a batch of experiences.
+
+        Critic target:
+            Q_target = r + γ * Q_target(next_state, actor_target(next_state))
+        """
+        states, actions, rewards, next_states, dones = experiences
+
+        # --- update critic ---
+        with torch.no_grad():
+            actions_next = self.actor_target(next_states)
+            q_targets_next = self.critic_target(next_states, actions_next)
+            q_targets = rewards + (self.gamma * q_targets_next * (1 - dones))
+
+        q_expected = self.critic_local(states, actions)
+        critic_loss = F.mse_loss(q_expected, q_targets)
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), max_norm=1.0)
+        self.critic_optimizer.step()
+
+        # --- update actor ---
+        actions_pred = self.actor_local(states)
+        actor_loss = -self.critic_local(states, actions_pred).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # --- soft update targets ---
+        self.soft_update(self.critic_local, self.critic_target, self.tau)
+        self.soft_update(self.actor_local, self.actor_target, self.tau)
+
+    @staticmethod
+    def soft_update(local_model: torch.nn.Module, target_model: torch.nn.Module, tau: float) -> None:
+        """Soft-update model parameters: θ_target ← τθ_local + (1−τ)θ_target."""
+        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
+            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+
+    @staticmethod
+    def _noise_scale_for_progress(progress: float, start_std: float, end_std: float) -> float:
+        """Return factor so that (factor * std_ou) ≈ desired_std(progress)."""
+        progress = float(progress)
+        desired_std = end_std + (start_std - end_std) * (1.0 - progress)
+        start_std = max(1e-8, start_std)
+        return desired_std / start_std
+
+
+class OUNoise:
+    """Ornstein–Uhlenbeck noise via Euler–Maruyama discretization.
+
+    dx = θ(μ − x)dt + σ√(dt) * N(0, I)
+
+    Attributes:
+        std_ou: Stationary standard deviation of the OU process (used to scale noise).
+    """
+
+    def __init__(
+        self,
+        size: int,
+        seed: int = None,
+        mu: float = 0.0,
+        theta: float = 0.15,
+        sigma: float = 0.2,
+        dt: float = 1.0,
+    ) -> None:
+        self.mu = np.full(size, mu, dtype=float)
+        self.theta = float(theta)
+        self.sigma = float(sigma)
+        self.dt = float(dt)
+
+        self.rng = np.random.RandomState(seed)
+
+        # Stationary std for the discrete-time OU approximation.
+        denom = max(1e-12, 2.0 * self.theta - (self.theta ** 2) * self.dt)
+        self.std_ou = self.sigma / np.sqrt(denom)
+
+        self.state = self.mu.copy()
+
+    def reset(self) -> None:
+        """Reset internal state to the mean μ (use at episode start)."""
+        self.state = self.mu.copy()
+
+    def sample(self) -> np.ndarray:
+        """Advance the OU process one step and return the new state."""
+        x = self.state
+        noise = self.rng.normal(0.0, 1.0, size=x.shape)
+        dx = self.theta * (self.mu - x) * self.dt + self.sigma * np.sqrt(self.dt) * noise
+        self.state = x + dx
+        return self.state
+
+
+class ReplayBuffer:
+    """Fixed-size buffer storing experience tuples for off-policy learning."""
+
+    def __init__(
+        self,
+        state_size: int,
+        action_size: int,
+        buffer_size: int,
+        batch_size: int,
+        seed: int,
+        obs_norm,  # type: object
+    ) -> None:
+        """Create a ReplayBuffer.
+
+        Args:
+            state_size: Dimension of state vectors (unused but informative).
+            action_size: Dimension of action vectors.
+            buffer_size: Maximum number of experiences to retain.
+            batch_size: Number of samples returned by `sample()`.
+            seed: RNG seed for Python's `random`.
+            obs_norm: Normalizer instance; called for `update()` and `normalize()`.
+        """
+        _ = state_size  # intentionally unused; kept for clarity
+        self.action_size = action_size
+        self.memory = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.experience = namedtuple(
+            "Experience", field_names=["state", "action", "reward", "next_state", "done"]
+        )
+        random.seed(seed)
+        self.obs_norm = obs_norm
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        """Add a new experience to memory."""
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
+
+    def sample(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Randomly sample a batch of experiences (with normalized observations)."""
+        experiences = random.sample(self.memory, k=self.batch_size)
+
+        states = torch.from_numpy(
+            np.vstack([self.obs_norm.normalize(e.state) for e in experiences])
+        ).float().to(device)
+
+        actions = torch.from_numpy(
+            np.vstack([e.action for e in experiences])
+        ).float().to(device)
+
+        rewards = torch.from_numpy(
+            np.vstack([e.reward for e in experiences])
+        ).float().to(device)
+
+        next_states = torch.from_numpy(
+            np.vstack([self.obs_norm.normalize(e.next_state) for e in experiences])
+        ).float().to(device)
+
+        dones = torch.from_numpy(
+            np.vstack([e.done for e in experiences]).astype(np.uint8)
+        ).float().to(device)
+
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self) -> int:
+        """Current size of the replay buffer."""
+        return len(self.memory)
+
+
+class NormPlaceholder:
+    """No-op normalizer (for disabling normalization without branching)."""
+
+    def __init__(self, size: int) -> None:
+        pass
+
+    def update(self, x: np.ndarray) -> None:
+        """No-op."""
+        return None
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """Return inputs unchanged."""
+        return x
+
+
+class SimpleNormalizer:
+    """Per-feature running mean/variance normalizer with clipping."""
+
+    def __init__(self, size: int, eps: float = 1e-4, clip: float = 5.0) -> None:
+        self.mean = np.zeros(size, dtype=np.float32)
+        self.var = np.ones(size, dtype=np.float32)
+        self.count = float(eps)
+        self.clip = float(clip)
+        self._eps = 1e-8
+
+    def update(self, x: np.ndarray) -> None:
+        """Update running mean/variance from raw env observations.
+
+            x: Shape (D,) or (N, D), raw observations *before* replay.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[0:][None, :]  # ensure (1, D)
+
+        batch_mean = x.mean(axis=0)
+        batch_var = x.var(axis=0)
+        batch_count = float(x.shape[0])
+
+        # Parallel/online mean & variance update
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * (batch_count / tot_count)
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + (delta ** 2) * (self.count * batch_count / tot_count)
+        new_var = m2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """Return normalized and clipped observation."""
+        x = np.asarray(x, dtype=np.float32)
+        x = (x - self.mean) / np.sqrt(self.var + self._eps)
+        return np.clip(x, -self.clip, self.clip)
