@@ -186,3 +186,145 @@ class ReplayBuffer:
     def __len__(self) -> int:
         """Current size of the replay buffer."""
         return len(self.memory)
+
+class FenwickTree:
+    def __init__(self, buffer_size):
+        self.buffer_size = buffer_size
+        self.bit = [None] + [0]*buffer_size
+        self.leafs = [0]*buffer_size
+
+    def add(self, delta, index):
+        index += 1
+        while index <= self.buffer_size:
+            self.bit[index] += delta
+            index += index & -index
+
+    def set(self, value, index):
+        delta = value - self.leafs[index]
+        self.leafs[index] = value
+        self.add(delta=delta, index=index)
+
+    def prefix(self, index):
+        index += 1
+        s = 0
+        while index > 0:
+            s += self.bit[index]
+            index -= index & -index
+        return s
+    
+    def total(self):
+        return self.prefix(self.buffer_size-1)
+    
+    def find_by_prefix(self, u: float) -> int:
+        idx = 0
+        bit_mask = 1 << (self.buffer_size.bit_length() - 1)
+        while bit_mask > 0:
+            next_idx = idx + bit_mask
+            if next_idx <= self.buffer_size and float(self.bit[next_idx]) < u:
+                u -= float(self.bit[next_idx])
+                idx = next_idx
+            bit_mask >>= 1
+        return idx
+
+class PERBuffer:
+    """Prioritized Experience Replay buffer."""
+
+    def __init__(
+        self,
+        state_size: int,
+        action_size: int,
+        buffer_size: int,
+        batch_size: int,
+        seed: int,
+        alpha: float,
+        obs_norm = NormPlaceholder(-1),
+    ) -> None:
+        _ = state_size  # intentionally unused; kept for clarity
+        self.action_size = action_size
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.alpha = alpha
+        self.epsilon = 1e-5
+        random.seed(seed)
+
+        self.head = 0
+        self.cnt = 0
+        self.max_priority = 1.0
+        self.memory = [None]*buffer_size
+        self.fw = FenwickTree(buffer_size=buffer_size)
+
+        self.experience = namedtuple(
+            "Experience", field_names=["state", "action", "reward", "next_state", "done"]
+        )
+        self.obs_norm = obs_norm
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> int:
+        """Add a new experience to memory."""
+        ind = self.head
+        self.head = (self.head + 1) % self.buffer_size
+        self.cnt = min((self.cnt + 1), self.buffer_size)
+
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory[ind] = e
+        self.fw.set(value=(self.max_priority + self.epsilon) ** self.alpha, index=ind)
+        return ind
+    
+    def _get_by_indices(self, indices):
+        experiences = [self.memory[i] for i in indices]
+
+        states = torch.from_numpy(
+            np.vstack([self.obs_norm.normalize(e.state) for e in experiences])
+        ).float().to(device)
+
+        actions = torch.from_numpy(
+            np.vstack([e.action for e in experiences])
+        ).float().to(device)
+
+        rewards = torch.from_numpy(
+            np.vstack([e.reward for e in experiences])
+        ).float().to(device)
+
+        next_states = torch.from_numpy(
+            np.vstack([self.obs_norm.normalize(e.next_state) for e in experiences])
+        ).float().to(device)
+
+        dones = torch.from_numpy(
+            np.vstack([e.done for e in experiences]).astype(np.uint8)
+        ).float().to(device)
+
+        return (states, actions, rewards, next_states, dones)
+
+    def sample(
+        self,
+        beta
+    ) -> Tuple[Tuple, list, np.array]:
+        assert self.cnt >= self.batch_size, "PERBuffer not warmed up"
+        S = self.fw.prefix(self.cnt - 1)
+        mass_sampling = [(np.random.random()+i)/self.batch_size for i in range(self.batch_size)]
+        mass_sampling_indices = [min(self.fw.find_by_prefix(u * S), self.cnt-1) for u in mass_sampling]
+
+        IS_weights = torch.tensor([(S / max(1, self.cnt) / max(self.fw.leafs[i], 1e-12))**beta 
+                           for i in mass_sampling_indices]).to(device)
+        IS_weights = IS_weights / IS_weights.max()
+
+        experiences = self._get_by_indices(mass_sampling_indices)
+
+        return experiences, mass_sampling_indices, IS_weights
+    
+    def update(self, errors, indices):
+        p = np.abs(errors) + self.epsilon
+        masses = p ** self.alpha
+        for mass, index in zip(masses, indices):
+            self.fw.set(mass, index)
+        self.max_priority = max(self.max_priority, masses.max())
+
+    def __len__(self) -> int:
+        """Current size of the replay buffer."""
+        return self.cnt
